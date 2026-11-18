@@ -11,6 +11,8 @@
 # A fork's own service names its repository here (README.md, "Your own build service"):
 # [vars]
 # REPO = "you/mod-builds"
+[vars]
+REPO = "blob83/mod-builds"
 name = "starling-compile"
 main = "src/index.js"
 compatibility_date = "2025-06-01"
