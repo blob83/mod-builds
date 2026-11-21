@@ -1,0 +1,91 @@
+name: store-base
+run-name: store-base ${{ inputs.build }} ${{ inputs.abi }}
+# Compile v2's base for one game build (a Nightly's commit) and ABI: the APK's own Cargo build, as Starling's
+# android-sdk workflow makes it (scripts/store_base.sh), kept as this repository's build cache so each mod's library
+# builds beside it in a minute (mod.yml, catalog.yml) against the very libraries the APK ships. Given the Nightly's
+# APK, the game's libraries built here are checked against the APK's first: a mod built beside other ones would not
+# load on the phone. Then the build goes into the store's builds.json, which the game reads.
+#
+# Only trusted code runs here (Starling at that commit), and only here is that cache written. Starling's nightly
+# workflow can start this one, through the GitHub App; then catalog.yml builds Horizon's catalog for it.
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: The game build (the full commit the APK is built from)
+        required: true
+      abi:
+        description: The ABI
+        default: arm64-v8a
+      profile:
+        description: The Cargo profile the APK is built with (fast for players' Nightlies, quick for tests)
+        type: choice
+        options: [fast, quick]
+        default: fast
+      nightly:
+        description: The Nightly that ships the build
+        default: ''
+      apk:
+        description: The Nightly's APK for this ABI, on GitHub, to check the game's libraries against
+        default: ''
+permissions:
+  contents: read
+concurrency: store-base-${{ inputs.build }}-${{ inputs.abi }}
+jobs:
+  base:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 240
+    env:
+      BUILD: ${{ inputs.build }}
+      ABI: ${{ inputs.abi }}
+      PROFILE: ${{ inputs.profile }}
+      APK: ${{ inputs.apk }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      # Before the room is made: `room.sh clean` deletes the runner's Android SDK, sdkmanager with it (base.yml
+      # installs its tools first too).
+      - name: The Android tools
+        run: |
+          (yes || true) | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --sdk_root="$HOME/android" \
+            --install "ndk;28.2.13676358" "build-tools;35.0.0" "platforms;android-36" | tail -3
+      - name: Make room
+        run: bash scripts/room.sh clean
+      - name: The game's build
+        run: bash scripts/store_base.sh
+      - uses: actions/cache/save@v4
+        with:
+          key: store-${{ inputs.build }}-${{ inputs.abi }}-${{ inputs.profile }}
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+  register:
+    needs: base
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    # builds.json is written by one job at a time.
+    concurrency:
+      group: store
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      BUILD: ${{ inputs.build }}
+      ABI: ${{ inputs.abi }}
+      PROFILE: ${{ inputs.profile }}
+      NIGHTLY: ${{ inputs.nightly }}
+      APK: ${{ inputs.apk }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The build in the store
+        run: python3 scripts/store.py register

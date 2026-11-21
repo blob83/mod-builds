@@ -1,0 +1,116 @@
+name: mod
+run-name: mod ${{ inputs.job }} ${{ inputs.build }}
+# Compile v2: one mod's library for one game build (a Nightly) and ABI, asked for through Starling's
+# Compile service (worker/, POST /v2/mod) for a mod the store doesn't have yet. As build.yml: the service
+# keeps the .hmod sealed in the `requests` release, the first job opens it with the key in this run's
+# inputs and builds it beside the build's base (store-base.yml) in the sandbox (scripts/sandbox.sh: no
+# network, nothing of the runner's), with a token that can only read; the second job runs nothing of the
+# mod and puts the answer in mods-<build>, where the game downloads it (scripts/store.py publish); the
+# third makes that build's index again.
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: The game build (its commit), in the store's builds.json
+        required: true
+      abi:
+        description: The ABI the library is for
+        required: true
+      job:
+        description: The job the game follows (the .hmod's SHA-256 and the ABI)
+        required: true
+      ask:
+        description: The sealed .hmod's name in the requests release
+        required: true
+      key:
+        description: What opens it; never written in this file, so never in the log
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    env:
+      BUILD: ${{ inputs.build }}
+      ABI: ${{ inputs.abi }}
+      JOB: ${{ inputs.job }}
+      ASK: ${{ inputs.ask }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The build's profile
+        run: python3 scripts/store.py env
+      - name: Make room
+        run: bash scripts/room.sh
+      # The base of this build (store-base.yml): the APK's own Cargo build, which only that workflow writes.
+      - uses: actions/cache/restore@v4
+        with:
+          key: store-${{ inputs.build }}-${{ inputs.abi }}-${{ env.PROFILE }}
+          fail-on-cache-miss: true
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: The mod
+        run: bash scripts/unseal.sh
+      - name: Build
+        env:
+          SANDBOX_SECONDS: '1200'
+        run: bash scripts/sandbox.sh jobs.json mods result
+      - uses: actions/upload-artifact@v4
+        with:
+          name: result
+          path: result/
+          retention-days: 1
+          compression-level: 1
+          if-no-files-found: error
+  publish:
+    needs: build
+    if: always()
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    env:
+      BUILD: ${{ inputs.build }}
+      JOB: ${{ inputs.job }}
+      ASK: ${{ inputs.ask }}
+      BUILT: ${{ needs.build.result }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        if: needs.build.result == 'success'
+        continue-on-error: true
+        with:
+          name: result
+          path: result/
+      - name: The answer
+        run: python3 scripts/store.py publish result
+  index:
+    needs: publish
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    # One index of a build at a time; a newer one waiting takes the place of an older, and lists all.
+    concurrency:
+      group: index-${{ inputs.build }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      BUILD: ${{ inputs.build }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: The index
+        run: python3 scripts/store.py index

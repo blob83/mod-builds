@@ -10,43 +10,16 @@ Native mods are compiled into [Starling](https://github.com/starling-client/star
 
 Runs and their logs are public, but the mods aren't: the key never shows up in a log. Builds are kept for two weeks.
 
-## Your own build service
+The service's answer to a build names this repository (`repo`), and a Starling that knows it waits for `results-<job's first digit>/<job>.json` (or `.failed.json`) and downloads `<job>.so` straight from GitHub, asking the service only every ten minutes or so while it waits. A Starling before it asks `GET /v1/job/<job>` again two seconds after each answer, so the service holds that answer up to 25 s.
 
-Anyone can run their own copy of this, on their own GitHub and Cloudflare accounts, and point Starling at it. It costs nothing: Actions are free on a public repository, and so are Workers up to 100,000 requests a day.
+## Compile v2: a library per mod
 
-1. **Fork** this repository, and keep the fork public (on a private one, every build spends your Actions minutes).
-2. **Turn on Actions** in the fork: the Actions tab, then "I understand my workflows, go ahead and enable them". GitHub turns off the workflows of a fork, `clean.yml`'s schedule too.
-3. **Make the releases** the builds go to. With the [GitHub CLI](https://cli.github.com/), in a Bash shell:
-   ```bash
-   for tag in requests results results-{0..9} results-{a..f}; do
-     gh release create "$tag" -R YOU/mod-builds --prerelease --title "$tag" --notes ""
-   done
-   ```
-4. **Build the base** of each version in `versions.json`: Actions, `base`, Run workflow, with the version (`0.8.0`). It takes about a quarter of an hour, and every player's build starts from it. Run it again when a version is added. Each base is about 3 GB of Actions cache, and a repository gets 10 GB.
-5. **Give the service a way in**, one of:
-   - a GitHub App (Settings, Developer settings, GitHub Apps, New), with Actions and Contents set to Read and write, installed on the fork alone. Its token has its own hourly limit, and failed runs don't mail you. Keep its id and a private key.
-   - a fine-grained token (Settings, Developer settings, Personal access tokens), for the fork alone, with Actions and Contents set to Read and write. It shares your 5,000 API calls an hour, and GitHub mails you every run that fails.
-6. **Put the service on Cloudflare**, with [Node.js](https://nodejs.org/) and a free Cloudflare account. In `worker/wrangler.toml`, add your fork:
-   ```toml
-   [vars]
-   REPO = "YOU/mod-builds"
-   ```
-   then, in `worker/`:
-   ```bash
-   npm install
-   npx wrangler login
-   npx wrangler deploy
-   ```
-   and give it the App:
-   ```bash
-   echo 123456| npx wrangler secret put GITHUB_APP_ID
-   openssl pkcs8 -topk8 -nocrypt -in the-app.private-key.pem | npx wrangler secret put GITHUB_APP_KEY
-   ```
-   or the token: `npx wrangler secret put GITHUB_TOKEN`, then paste it. `wrangler deploy` prints the service's address, `https://starling-compile.SOMETHING.workers.dev`.
-7. **In Starling**: Options, Mods, the Native mods card, **Build server...**, then the address and **Use this server**. Only `https://` addresses are taken. **Use Starling's** goes back to Starling's own.
+With the game as a set of Rust libraries (a Nightly APK built with `-C prefer-dynamic`, Starling's `tools/android_native_sdk.py`), a native mod is a small library of its own, `lib<id>.so`, built once for each game build and ABI beside that build's own Cargo build, and kept in a store the game reads straight from GitHub into its `native-libs` folder:
 
-What a service can do, as it is: GitHub runs 20 jobs at a time on a free account (each build is two), the service starts 32 builds a day for one address and 1,500 for everyone (`PER_ADDRESS` and `PER_DAY` in `worker/src/index.js`), and the free Workers plan answers 100,000 requests a day. Past that, Cloudflare answers 429 until midnight UTC.
+- `store-base.yml` makes a build's base: Starling at the build's commit, `android_native_sdk.py prepare` and `build_apk.py --library-only` with `-C prefer-dynamic`, kept as the build cache `store-<build>-<abi>-<profile>` (`scripts/store_base.sh`). Given the Nightly's APK, it first checks that each library of the game built here (`libemutls.so` too) is the APK's, as a mod built beside other ones wouldn't load on the phone. `prepare` makes adding a mod's package change only `Cargo.lock`, so a mod's build doesn't build the game again. Then it adds the build to `store/builds.json`.
+- `store/builds.json`: every game build the store serves, newest first: its commit, its Nightly, the Cargo profile of its APK, and its ABIs.
+- `mods-<build>/index.json`: that build's mods, each id, version and `.hmod` SHA-256 to its library (`<job>.so`, named `lib<id>.so` on the phone), the library's SHA-256 and its identity, and the mods that failed there. A job is the `.hmod`'s SHA-256 (32 digits) and the ABI.
+- `catalog.yml` builds every native mod of [Horizon's catalog](https://horizon-rust.github.io/horizon-mods/) for one build, ahead of the players.
+- `mod.yml` builds one mod the store doesn't have, asked through the service (`POST /v2/mod?build=B&abi=A` with the `.hmod`). Its answer is `mods-<build>/<job>.json` or `.failed.json`, which the game waits for on GitHub.
 
-The library a build makes runs inside the game on the player's phone, so whoever runs a build service can put anything in it. Only point Starling at a service you trust, and only tell players to use yours if they trust you.
-
-More in [docs/starling-native-mods.md](https://github.com/starling-client/starling/blob/starling/docs/starling-native-mods.md).
+Both build in a sandbox (`scripts/sandbox.sh`: no network, the base seen through a layer thrown away after) with a token that can only read, and publish from a job that runs nothing of the mods (`scripts/store.py`). Only a mod `android_native_sdk.py mods` takes is built: no `[native.*]` tables, build script, features, or crate but `horizon-mod-api`; any other is told it needs the whole-game Compile. `python -m unittest discover -s scripts` tests the scripts.

@@ -3,14 +3,28 @@
 // GitHub Actions as the machines and its releases as the store. It replaces the gateway that
 // lived on a paid VM (mod_build_gateway.py) and keeps the game's side as it was:
 //
-//   POST /v1/build?version=V   the mods (the game's bundle) in the body: {"job"}, or {"error"}
+//   POST /v1/build?version=V   the mods (the game's bundle) in the body: {"job", "repo"}, or {"error"}
 //   GET  /v1/job/J             {"state": "queued" | "building" | "done" | "failed", ...}
 //   GET  /v1/job/J/lib         the library, from the `results` release (a redirect)
 //
+// A Starling that knows `repo` waits for the answer in that repository's releases itself
+// (results-<J's first digit>/J.json or J.failed.json, then J.so), and asks /v1/job only now and
+// then: the free plan counts every request, and the hold below is for the Starlings before it.
+//
+// Compile v2, one library per mod, built against a game build's SDK (a Nightly) and kept in the
+// store (scripts/store.py): the game reads store/builds.json and mods-<build>/index.json straight
+// from GitHub, and comes here only for a mod the index doesn't have:
+//
+//   POST /v2/mod?build=B&abi=A the mod's .hmod in the body: {"job", "repo", "tag"}, or {"error"}
+//   GET  /v2/mod/B/J           where job J stands, when its answer is long in coming
+//
+// J is the .hmod's SHA-256 (32 digits) and the ABI, `<sha>.<abi>`; its answer is J.json or
+// J.failed.json in the release `tag` (mods-B), and its library J.so.
+//
 // The mods are sealed (AES-256-CTR, a key of their own) before they leave here, kept as an asset
-// of the `requests` release under a random name, and the key goes to the build in its inputs,
-// which only the run reads (build.yml, scripts/unseal.sh). The same mods on the same commit are
-// the same job: what was built once is served again without a build.
+// of the `requests` release, and the key goes to the build in its inputs, which only the run
+// reads (build.yml, mod.yml, scripts/unseal.sh). The same mods on the same commit are the same
+// job: what was built once is served again without a build.
 //
 // Secrets: GITHUB_APP_ID and GITHUB_APP_KEY (a GitHub App installed on this repository), or
 // GITHUB_TOKEN, a fine-grained token for this repository only, with Actions and Contents read and
@@ -26,8 +40,11 @@ const API = "https://api.github.com";
 const UPLOADS = "https://uploads.github.com";
 const downloads = () => `https://github.com/${REPO}/releases/download`;
 const WORKFLOW = "build.yml";
+const MOD_WORKFLOW = "mod.yml";
 const REQUESTS = "requests";
 const RESULTS = "results";
+// The store's own release: builds.json, every game build the store serves (scripts/store.py).
+const STORE = "store";
 
 // What the game sends at most (its LARGEST_REQUEST).
 export const MAX_BODY = 32 << 20;
@@ -54,6 +71,11 @@ const DID_NOT_FINISH = "The build on GitHub did not finish. Try again.";
 
 const JOB = /^[0-9a-f]{24}$/;
 const VERSION = /^\d+(\.\d+){1,3}$/;
+// A game build is its commit; a mod's job is its .hmod's hash and the ABI it is built for.
+const BUILD = /^[0-9a-f]{40}$/;
+export const ABIS = ["arm64-v8a", "armeabi-v7a", "x86_64", "x86"];
+const MOD_JOB = new RegExp(`^[0-9a-f]{32}\\.(${ABIS.join("|")})$`);
+const NO_SUCH_BUILD = "This build of the game can't compile mods here. Update Starling.";
 
 const NOT_HERE = "No such thing here.";
 const YOUR_LIMIT = "You have compiled a lot today. Try again tomorrow.";
@@ -73,6 +95,17 @@ export default {
         if (parts.length === 3) return await status(parts[2], env, ctx);
         if (parts.length === 4 && parts[3] === "lib") return await library(parts[2], request);
       }
+      if (request.method === "POST" && url.pathname === "/v2/mod") return await modBuild(request, url, env, ctx);
+      if (
+        request.method === "GET" &&
+        parts.length === 4 &&
+        parts[0] === "v2" &&
+        parts[1] === "mod" &&
+        BUILD.test(parts[2]) &&
+        MOD_JOB.test(parts[3])
+      ) {
+        return await modStatus(parts[2], parts[3], env, ctx);
+      }
       return answer(404, { error: NOT_HERE });
     } catch (e) {
       console.log(`${request.method} ${url.pathname}: ${e?.stack ?? e}`);
@@ -91,12 +124,8 @@ export function repoOf(env) {
 async function build(request, url, env, ctx) {
   const version = url.searchParams.get("version") ?? "";
   if (!VERSION.test(version)) return answer(400, { error: "That is not a version of the game." });
-  const declared = Number(request.headers.get("Content-Length") ?? 0);
-  if (declared > MAX_BODY) return answer(413, { error: "That is too big to compile." });
-  const body = new Uint8Array(await request.arrayBuffer());
-  if (body.length === 0 || body.length > MAX_BODY) {
-    return answer(413, { error: "That is too big to compile." });
-  }
+  const body = await bodyOf(request);
+  if (!body) return answer(413, { error: "That is too big to compile." });
   const commit = (await versions())[version];
   if (!commit) {
     return answer(400, {
@@ -104,24 +133,25 @@ async function build(request, url, env, ctx) {
     });
   }
   const job = await jobOf(version, commit, body);
+  // Where the game waits for the answer by itself, with no request here (results-<job[0]>).
+  const told = { job, repo: REPO };
   // Built before, failing for good, or on its way: the job is all the game needs. A failure that
   // may pass another time (a machine that went away) is built again.
-  if (await published(`${job}.json`, ctx)) return answer(200, { job });
+  if (await published(`${job}.json`, ctx)) return answer(200, told);
   const failure = await failureOf(job, ctx);
-  if (failure?.settled) return answer(200, { job });
+  if (failure?.settled) return answer(200, told);
   const asked = await recall(`asked/${job}`);
   if (asked && !(failure && (failure.at ?? 0) >= asked.at)) {
     // Still on its way, or not long enough asked to tell: the same job. One asked long ago and
     // gone from the line without an answer is built again.
     const gone = now() - asked.at > LOST_SECONDS && !(await running(job, env, ctx));
-    if (!gone) return answer(200, { job });
+    if (!gone) return answer(200, told);
   }
   const run = failure ? null : await running(job, env, ctx, false);
-  if (run && !run.unknown) return answer(200, { job });
+  if (run && !run.unknown) return answer(200, told);
 
-  const address = await hashed(request.headers.get("CF-Connecting-IP") ?? "unknown");
-  if (!(await count(`address/${address}`, PER_ADDRESS, ctx))) return answer(429, { error: YOUR_LIMIT });
-  if (!(await count("everyone", PER_DAY, ctx))) return answer(429, { error: EVERYONES_LIMIT });
+  const limited = await limit(request, ctx);
+  if (limited) return limited;
 
   const { sealed, key } = await seal(body);
   const ask = hex(crypto.getRandomValues(new Uint8Array(16)));
@@ -131,7 +161,134 @@ async function build(request, url, env, ctx) {
     inputs: { job, ask, key, version },
   });
   ctx.waitUntil(remember(`asked/${job}`, { at: now() }, LONGEST));
-  return answer(200, { job });
+  return answer(200, told);
+}
+
+/** The request's body, or null when it is empty or bigger than the service takes. */
+async function bodyOf(request) {
+  const declared = Number(request.headers.get("Content-Length") ?? 0);
+  if (declared > MAX_BODY) return null;
+  const body = new Uint8Array(await request.arrayBuffer());
+  return body.length === 0 || body.length > MAX_BODY ? null : body;
+}
+
+/** The 429 the game shows when this address, or everyone, has built enough today; else null. */
+async function limit(request, ctx) {
+  const address = await hashed(request.headers.get("CF-Connecting-IP") ?? "unknown");
+  if (!(await count(`address/${address}`, PER_ADDRESS, ctx))) return answer(429, { error: YOUR_LIMIT });
+  if (!(await count("everyone", PER_DAY, ctx))) return answer(429, { error: EVERYONES_LIMIT });
+  return null;
+}
+
+/**
+ * Compile v2: one mod's library for game build `build` and `abi`, or the job that has it. Nothing
+ * here leans on this location's cache (on *.workers.dev Cloudflare keeps none): a job is done when
+ * its J.json is in mods-<build>, and on its way while its sealed request is in `requests`, under a
+ * name made from the job, so a second ask finds it there and starts nothing (mod.yml lets it go
+ * when it publishes, scripts/clean.py after six hours).
+ */
+async function modBuild(request, url, env, ctx) {
+  const build = url.searchParams.get("build") ?? "";
+  const abi = url.searchParams.get("abi") ?? "";
+  if (!BUILD.test(build) || !ABIS.includes(abi)) return answer(400, { error: NO_SUCH_BUILD });
+  const body = await bodyOf(request);
+  if (!body) return answer(413, { error: "That is too big to compile." });
+  const known = (await builds()).find((b) => b.build === build);
+  if (!known?.abis?.[abi]) return answer(400, { error: NO_SUCH_BUILD });
+  const job = await modJobOf(body, abi);
+  const tag = modsTag(build);
+  const told = { job, repo: REPO, tag };
+  if (await there(tag, `${job}.json`)) return answer(200, told);
+  const failure = await jsonIn(tag, `${job}.failed.json`);
+  if (failure?.settled) return answer(200, told);
+  const ask = await askOf(build, job);
+  if (await there(REQUESTS, `${ask}.bin`)) return answer(200, told);
+
+  const limited = await limit(request, ctx);
+  if (limited) return limited;
+
+  const { sealed, key } = await seal(body);
+  // Two games asking at once: the second upload finds the first's, and builds nothing.
+  if (!(await upload(env, ctx, REQUESTS, `${ask}.bin`, sealed))) return answer(200, told);
+  await github(env, "POST", `/actions/workflows/${MOD_WORKFLOW}/dispatches`, {
+    ref: "main",
+    inputs: { build, abi, job, ask, key },
+  });
+  return answer(200, told);
+}
+
+/**
+ * Where a v2 job stands, for a game whose answer is long in coming (it waits on GitHub itself and
+ * asks here every ten minutes or so): its answer, its place in the line, or that its run ended
+ * without one, which lets the request go so that asking again builds it again.
+ */
+async function modStatus(build, job, env, ctx) {
+  const tag = modsTag(build);
+  const done = await jsonIn(tag, `${job}.json`);
+  if (done) return answer(200, done);
+  const ask = await askOf(build, job);
+  if (await there(REQUESTS, `${ask}.bin`)) {
+    const run = await running(job, env, ctx, true, MOD_WORKFLOW, modTitle(build, job));
+    if (run?.unknown) throw new Error(`the line of ${job} can't be read`);
+    if (run) return answer(200, run);
+    const asset = (await assets(env, ctx, REQUESTS)).find((a) => a.name === `${ask}.bin`);
+    const since = asset ? Date.parse(asset.created_at) / 1000 : now();
+    if (now() - since <= LOST_SECONDS) {
+      // Asked a moment ago: GitHub lists a run a little after it is asked for.
+      return answer(200, { state: "queued", ahead: (await queue(env, ctx, false, MOD_WORKFLOW)).queued.length });
+    }
+    if (asset) await github(env, "DELETE", `/releases/assets/${asset.id}`);
+    return answer(200, { state: "failed", error: DID_NOT_FINISH, settled: false });
+  }
+  const failure = await jsonIn(tag, `${job}.failed.json`);
+  if (failure) {
+    const { state, error, settled } = failure;
+    return answer(200, { state, error, settled: Boolean(settled) });
+  }
+  return answer(404, { error: "No such job." });
+}
+
+/** The release of game build `build` in the store: its index.json and its mods' libraries. */
+export function modsTag(build) {
+  return `mods-${build}`;
+}
+
+/** A v2 job: the .hmod's SHA-256 (128 bits of it) and the ABI it is built for. */
+export async function modJobOf(body, abi) {
+  return `${hex(new Uint8Array(await crypto.subtle.digest("SHA-256", body))).slice(0, 32)}.${abi}`;
+}
+
+/** The sealed request's name in `requests`, the same for the same job on the same build. */
+export async function askOf(build, job) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(`mod ${build} ${job}`));
+  return hex(new Uint8Array(digest)).slice(0, 32);
+}
+
+/** mod.yml's run-name for a job, which the line is read by. */
+function modTitle(build, job) {
+  return `mod ${job} ${build}`;
+}
+
+/** store/builds.json's builds, newest first; none while the store has none. */
+async function builds() {
+  const listed = await jsonIn(STORE, "builds.json", { cf: { cacheTtl: 300, cacheEverything: true } });
+  return Array.isArray(listed?.builds) ? listed.builds : [];
+}
+
+/** Whether release `tag` has an asset `name`, from its download (no API call): GitHub sends it on. */
+async function there(tag, name) {
+  const response = await fetch(`${downloads()}/${tag}/${name}`, { method: "HEAD", redirect: "manual" });
+  if (response.status === 404) return false;
+  if (response.status < 400) return true;
+  throw new Error(`${tag}/${name}: ${response.status}`);
+}
+
+/** The JSON asset `name` of release `tag`, or null when it is not there. */
+async function jsonIn(tag, name, init = {}) {
+  const response = await fetch(`${downloads()}/${tag}/${name}`, { redirect: "follow", ...init });
+  if (response.status === 404) return null;
+  if (!response.ok) throw new Error(`${tag}/${name}: ${response.status}`);
+  return response.json();
 }
 
 /**
@@ -289,16 +446,15 @@ function failureOf(job, ctx) {
 }
 
 /** The job's run on GitHub when it is queued or going: what the game is told of it. */
-async function running(job, env, ctx, mayLookAgain = true) {
-  const title = `build ${job}`;
+async function running(job, env, ctx, mayLookAgain = true, workflow = WORKFLOW, title = `build ${job}`) {
   try {
-    let found = placeIn(await queue(env, ctx), title);
+    let found = placeIn(await queue(env, ctx, false, workflow), title);
     // Not in the line as last seen: it moved since (from waiting to building, between two
     // looks), or that look came back short. Look again before calling it lost, at most every
     // LOOK_AGAIN_SECONDS here: a job told "No such job" is given up by the game.
-    if (!found && mayLookAgain && !(await recall("queue-fresh"))) {
-      await remember("queue-fresh", { at: now() }, LOOK_AGAIN_SECONDS);
-      found = placeIn(await queue(env, ctx, true), title);
+    if (!found && mayLookAgain && !(await recall(`queue-fresh/${workflow}`))) {
+      await remember(`queue-fresh/${workflow}`, { at: now() }, LOOK_AGAIN_SECONDS);
+      found = placeIn(await queue(env, ctx, true, workflow), title);
     }
     return found;
   } catch (e) {
@@ -323,8 +479,10 @@ function placeIn({ queued, building }, title) {
  * its place ("In line: N before yours") without a call of its own: GitHub gives a token 5,000 a
  * hour, and a busy hour has a hundred jobs in line asking every few seconds.
  */
-async function queue(env, ctx, fresh = false) {
-  const known = fresh ? null : await recall("queue");
+async function queue(env, ctx, fresh = false, workflow = WORKFLOW) {
+  // build.yml's line keeps its old name, which every location's cache already holds.
+  const name = workflow === WORKFLOW ? "queue" : `queue/${workflow}`;
+  const known = fresh ? null : await recall(name);
   if (known) return known.value;
   const list = async (status) => {
     const runs = [];
@@ -332,7 +490,7 @@ async function queue(env, ctx, fresh = false) {
       const { workflow_runs: some } = await github(
         env,
         "GET",
-        `/actions/workflows/${WORKFLOW}/runs?event=workflow_dispatch&status=${status}&per_page=100&page=${page}`,
+        `/actions/workflows/${workflow}/runs?event=workflow_dispatch&status=${status}&per_page=100&page=${page}`,
       );
       runs.push(...some);
       if (some.length < 100) break;
@@ -349,18 +507,36 @@ async function queue(env, ctx, fresh = false) {
     ]),
   );
   const value = { queued, building };
-  ctx.waitUntil(remember("queue", { value }, QUEUE_SECONDS));
+  ctx.waitUntil(remember(name, { value }, QUEUE_SECONDS));
   return value;
 }
 
-/** Puts `bytes` in release `tag` as `name`. */
+/**
+ * Puts `bytes` in release `tag` as `name`: true, or false when an asset of that name is there
+ * already (GitHub's 422 `already_exists`).
+ */
 async function upload(env, ctx, tag, name, bytes) {
   const id = await releaseId(env, ctx, tag);
   const response = await fetch(
     `${UPLOADS}/repos/${REPO}/releases/${id}/assets?name=${encodeURIComponent(name)}`,
     { method: "POST", headers: { ...(await headers(env)), "Content-Type": "application/octet-stream" }, body: bytes },
   );
-  if (!response.ok) throw new Error(`upload ${tag}/${name}: ${response.status} ${await response.text()}`);
+  if (response.ok) return true;
+  const text = await response.text();
+  if (response.status === 422 && text.includes("already_exists")) return false;
+  throw new Error(`upload ${tag}/${name}: ${response.status} ${text}`);
+}
+
+/** Release `tag`'s assets, up to 300 of them (`requests` holds a few hours of asks at most). */
+async function assets(env, ctx, tag) {
+  const id = await releaseId(env, ctx, tag);
+  const all = [];
+  for (let page = 1; page <= 3; page++) {
+    const some = await github(env, "GET", `/releases/${id}/assets?per_page=100&page=${page}`);
+    all.push(...some);
+    if (some.length < 100) break;
+  }
+  return all;
 }
 
 async function releaseId(env, ctx, tag) {

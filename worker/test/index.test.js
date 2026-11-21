@@ -2,7 +2,7 @@
 import { test, beforeEach } from "node:test";
 import assert from "node:assert/strict";
 import { createDecipheriv, createHash, generateKeyPairSync, verify } from "node:crypto";
-import worker, { jobOf, seal, repoOf, PER_ADDRESS, MAX_BODY } from "../src/index.js";
+import worker, { jobOf, seal, repoOf, modJobOf, askOf, modsTag, PER_ADDRESS, MAX_BODY } from "../src/index.js";
 
 const REPO = "starling-client/mod-builds";
 const COMMIT = "ac874422ed8f892505ff73d67ae486ecfee7a516";
@@ -22,11 +22,17 @@ class Cache {
   }
 }
 
-/** GitHub as the service sees it: two releases, the workflow's runs, versions.json. */
+/** GitHub as the service sees it: its releases, the workflows' runs, versions.json. */
 class GitHub {
   assets = { requests: new Map(), results: new Map() };
+  // When each asset came, by "tag/name", for the releases' asset lists.
+  created = new Map();
   runs = [];
+  // mod.yml's runs, apart from build.yml's.
+  modRuns = [];
   dispatched = [];
+  modDispatched = [];
+  deleted = [];
   calls = 0;
   async fetch(input, init = {}) {
     const url = new URL(typeof input === "string" ? input : input.url);
@@ -38,30 +44,62 @@ class GitHub {
     const download = url.href.match(new RegExp(`^https://github.com/${this.repo}/releases/download/([\\w-]+)/(.+)$`));
     if (download) {
       const bytes = this.assets[download[1]]?.get(download[2]);
-      return bytes ? new Response(bytes) : new Response("Not Found", { status: 404 });
+      if (!bytes) return new Response("Not Found", { status: 404 });
+      // A download is GitHub's redirect to where the file is; followed, the file.
+      if (init.redirect === "manual") return new Response(null, { status: 302, headers: { Location: "https://objects.example/x" } });
+      return new Response(method === "HEAD" ? null : bytes);
     }
     this.calls++;
     if (url.pathname.startsWith("/app/")) return this.app(url, method, init);
     assert.equal(init.headers?.Authorization, `Bearer ${this.token}`, "every API call carries the token");
+    const tags = Object.keys(this.assets);
     if (url.host === "uploads.github.com") {
-      const id = url.pathname.split("/")[5];
-      const tag = { 1: "requests", 2: "results" }[id];
-      this.assets[tag].set(url.searchParams.get("name"), new Uint8Array(await new Response(init.body).arrayBuffer()));
+      const tag = tags[Number(url.pathname.split("/")[5]) - 1];
+      const name = url.searchParams.get("name");
+      if (this.assets[tag].has(name)) {
+        return json(422, { message: "Validation Failed", errors: [{ resource: "ReleaseAsset", code: "already_exists", field: "name" }] });
+      }
+      this.assets[tag].set(name, new Uint8Array(await new Response(init.body).arrayBuffer()));
+      this.created.set(`${tag}/${name}`, new Date().toISOString());
       return json(201, {});
     }
     if (!url.pathname.startsWith(`/repos/${this.repo}/`)) return json(404, { message: "Not Found" });
     const path = url.pathname.replace(`/repos/${this.repo}`, "");
-    if (path === "/releases/tags/requests") return json(200, { id: 1 });
-    if (path === "/releases/tags/results") return json(200, { id: 2 });
-    if (method === "POST" && path === "/actions/workflows/build.yml/dispatches") {
-      this.dispatched.push(JSON.parse(init.body));
+    const tag = /^\/releases\/tags\/(.+)$/.exec(path)?.[1];
+    if (tag && tags.includes(tag)) return json(200, { id: tags.indexOf(tag) + 1 });
+    const listed = /^\/releases\/(\d+)\/assets$/.exec(path);
+    if (method === "GET" && listed) {
+      const of = tags[Number(listed[1]) - 1];
+      const page = Number(url.searchParams.get("page") ?? 1);
+      const all = [...this.assets[of].keys()].map((name, i) => ({
+        id: Number(listed[1]) * 1000 + i,
+        name,
+        created_at: this.created.get(`${of}/${name}`) ?? new Date().toISOString(),
+      }));
+      return json(200, page === 1 ? all : []);
+    }
+    const asset = /^\/releases\/assets\/(\d+)$/.exec(path);
+    if (method === "DELETE" && asset) {
+      const id = Number(asset[1]);
+      const of = tags[Math.floor(id / 1000) - 1];
+      const name = [...this.assets[of].keys()][id % 1000];
+      this.assets[of].delete(name);
+      this.deleted.push(`${of}/${name}`);
       return new Response(null, { status: 204 });
     }
-    if (path === "/actions/workflows/build.yml/runs") {
-      const status = url.searchParams.get("status");
-      const page = Number(url.searchParams.get("page") ?? 1);
-      const runs = this.runs.filter((r) => !status || r.status === status);
-      return json(200, { workflow_runs: page === 1 ? runs : [] });
+    for (const [workflow, dispatched, runs] of [
+      ["build.yml", this.dispatched, this.runs],
+      ["mod.yml", this.modDispatched, this.modRuns],
+    ]) {
+      if (method === "POST" && path === `/actions/workflows/${workflow}/dispatches`) {
+        dispatched.push(JSON.parse(init.body));
+        return new Response(null, { status: 204 });
+      }
+      if (path === `/actions/workflows/${workflow}/runs`) {
+        const status = url.searchParams.get("status");
+        const page = Number(url.searchParams.get("page") ?? 1);
+        return json(200, { workflow_runs: page === 1 ? runs.filter((r) => !status || r.status === status) : [] });
+      }
     }
     return json(404, { message: "Not Found" });
   }
@@ -177,7 +215,7 @@ test("mods built before are the same job, and nothing is built", async () => {
   const done = { state: "done", sha256: "a".repeat(64), size: 1234, build: { abi: "arm64-v8a" } };
   github.assets.results.set(`${job}.json`, new TextEncoder().encode(JSON.stringify(done)));
   const response = await call("POST", "/v1/build?version=0.8.0", { body: mods });
-  assert.deepEqual(await response.json(), { job });
+  assert.deepEqual(await response.json(), { job, repo: REPO });
   assert.equal(github.dispatched.length, 0);
   assert.equal(github.calls, 0, "no call to GitHub's API");
   const status = await call("GET", `/v1/job/${job}`);
@@ -333,7 +371,7 @@ test("a failure for good is not built again", async () => {
   const failed = { state: "failed", error: "error[E0425]: cannot find value", settled: true, at: 1 };
   github.assets.results.set(`${job}.failed.json`, new TextEncoder().encode(JSON.stringify(failed)));
   const response = await call("POST", "/v1/build?version=0.8.0", { body: mods });
-  assert.deepEqual(await response.json(), { job });
+  assert.deepEqual(await response.json(), { job, repo: REPO });
   assert.equal(github.dispatched.length, 0);
 });
 
@@ -446,4 +484,116 @@ test("GitHub out of reach is a 503 with words", async () => {
   const response = await call("POST", "/v1/build?version=0.8.0", { body: mods });
   assert.equal(response.status, 503);
   assert.match((await response.json()).error, /can't reach GitHub/);
+});
+
+// Compile v2: one library per mod, kept in the store.
+
+const BUILD = "5e1f0c2d3a4b5c6d7e8f90a1b2c3d4e5f6a7b8c9";
+const hmod = new TextEncoder().encode("PK the mod's .hmod ".repeat(50));
+
+/** The store with game build BUILD in it, for ARM64. */
+function store() {
+  const builds = { schema: 1, builds: [{ build: BUILD, nightly: "nightly-2026-11-20", abis: { "arm64-v8a": {} } }] };
+  github.assets.store = new Map([["builds.json", new TextEncoder().encode(JSON.stringify(builds))]]);
+  github.assets[modsTag(BUILD)] = new Map();
+}
+
+test("a v2 job is the .hmod's own hash and the ABI, the same as the store's", async () => {
+  const want = createHash("sha256").update(hmod).digest("hex").slice(0, 32);
+  assert.equal(await modJobOf(hmod, "arm64-v8a"), `${want}.arm64-v8a`);
+  assert.equal(await askOf(BUILD, `${want}.arm64-v8a`), await askOf(BUILD, `${want}.arm64-v8a`));
+  assert.notEqual(await askOf(BUILD, `${want}.arm64-v8a`), await askOf(BUILD, `${want}.x86_64`));
+});
+
+test("a mod the store doesn't have is sealed and built once, however often it is asked", async () => {
+  store();
+  const first = await call("POST", `/v2/mod?build=${BUILD}&abi=arm64-v8a`, { body: hmod });
+  assert.equal(first.status, 200);
+  const told = await first.json();
+  assert.deepEqual(told, { job: await modJobOf(hmod, "arm64-v8a"), repo: REPO, tag: `mods-${BUILD}` });
+  assert.equal(github.modDispatched.length, 1);
+  const { ref, inputs } = github.modDispatched[0];
+  assert.equal(ref, "main");
+  assert.deepEqual(Object.keys(inputs).sort(), ["abi", "ask", "build", "job", "key"]);
+  assert.equal(inputs.ask, await askOf(BUILD, told.job));
+  const sealed = github.assets.requests.get(`${inputs.ask}.bin`);
+  const opened = createDecipheriv("aes-256-ctr", Buffer.from(inputs.key.slice(0, 64), "hex"), Buffer.from(inputs.key.slice(64), "hex"));
+  assert.deepEqual(new Uint8Array(Buffer.concat([opened.update(sealed), opened.final()])), hmod);
+  // Asked again, from anywhere: its request is there, so it is on its way. No cache needed.
+  cache.entries.clear();
+  const again = await call("POST", `/v2/mod?build=${BUILD}&abi=arm64-v8a`, { body: hmod, address: "198.51.100.9" });
+  assert.deepEqual(await again.json(), told);
+  assert.equal(github.modDispatched.length, 1, "nothing new started");
+  assert.equal(github.dispatched.length, 0, "never the whole-game build");
+});
+
+test("a mod the store has, or that fails for good, starts nothing and calls no API", async () => {
+  store();
+  const job = await modJobOf(hmod, "arm64-v8a");
+  github.assets[modsTag(BUILD)].set(`${job}.json`, new TextEncoder().encode("{}"));
+  const before = github.calls;
+  assert.equal((await call("POST", `/v2/mod?build=${BUILD}&abi=arm64-v8a`, { body: hmod })).status, 200);
+  github.assets[modsTag(BUILD)].clear();
+  const failed = { state: "failed", error: "error[E0425]", settled: true, at: 1 };
+  github.assets[modsTag(BUILD)].set(`${job}.failed.json`, new TextEncoder().encode(JSON.stringify(failed)));
+  assert.equal((await call("POST", `/v2/mod?build=${BUILD}&abi=arm64-v8a`, { body: hmod })).status, 200);
+  assert.equal(github.calls, before, "no call to GitHub's API");
+  assert.equal(github.modDispatched.length, 0);
+  assert.deepEqual(await (await call("GET", `/v2/mod/${BUILD}/${job}`)).json(), { state: "failed", error: "error[E0425]", settled: true });
+});
+
+test("a failure that may pass is built again", async () => {
+  store();
+  const job = await modJobOf(hmod, "arm64-v8a");
+  const failed = { state: "failed", error: "GitHub's machine went away.", settled: false, at: 1 };
+  github.assets[modsTag(BUILD)].set(`${job}.failed.json`, new TextEncoder().encode(JSON.stringify(failed)));
+  await call("POST", `/v2/mod?build=${BUILD}&abi=arm64-v8a`, { body: hmod });
+  assert.equal(github.modDispatched.length, 1);
+});
+
+test("a build or ABI the store doesn't serve is said in words the game shows", async () => {
+  store();
+  for (const query of [`build=${BUILD}&abi=x86_64`, `build=${"0".repeat(40)}&abi=arm64-v8a`, `build=main&abi=arm64-v8a`, `build=${BUILD}&abi=mips`]) {
+    const response = await call("POST", `/v2/mod?${query}`, { body: hmod });
+    assert.equal(response.status, 400, query);
+    assert.match((await response.json()).error, /Update Starling/);
+  }
+  assert.equal((await call("POST", `/v2/mod?build=${BUILD}&abi=arm64-v8a`, { body: new Uint8Array() })).status, 413);
+  assert.equal(github.modDispatched.length, 0);
+});
+
+test("a v2 job long in coming: its place in line, its answer, or lost and asked again", async () => {
+  store();
+  const { job } = await (await call("POST", `/v2/mod?build=${BUILD}&abi=arm64-v8a`, { body: hmod })).json();
+  // Just asked, not listed yet: in line.
+  assert.equal((await (await call("GET", `/v2/mod/${BUILD}/${job}`)).json()).state, "queued");
+  github.modRuns = [{ display_title: `mod ${job} ${BUILD}`, status: "in_progress", run_started_at: new Date().toISOString() }];
+  cache.entries.clear();
+  assert.equal((await (await call("GET", `/v2/mod/${BUILD}/${job}`)).json()).state, "building");
+  // Its run gone without an answer, its request asked long ago: lost, and the request goes.
+  github.modRuns = [];
+  cache.entries.clear();
+  const ask = await askOf(BUILD, job);
+  github.created.set(`requests/${ask}.bin`, new Date(Date.now() - 900e3).toISOString());
+  assert.deepEqual(await (await call("GET", `/v2/mod/${BUILD}/${job}`)).json(), {
+    state: "failed",
+    error: "The build on GitHub did not finish. Try again.",
+    settled: false,
+  });
+  assert.deepEqual(github.deleted, [`requests/${ask}.bin`]);
+  await call("POST", `/v2/mod?build=${BUILD}&abi=arm64-v8a`, { body: hmod });
+  assert.equal(github.modDispatched.length, 2, "asked again: built again");
+  // Done: the answer the store has.
+  const done = { state: "done", sha256: "c".repeat(64), size: 9 };
+  github.assets[modsTag(BUILD)].set(`${job}.json`, new TextEncoder().encode(JSON.stringify(done)));
+  assert.deepEqual(await (await call("GET", `/v2/mod/${BUILD}/${job}`)).json(), done);
+  assert.equal((await call("GET", `/v2/mod/${BUILD}/${"f".repeat(32)}.arm64-v8a`)).status, 404);
+  assert.equal((await call("GET", `/v2/mod/${BUILD}/${job.replace("arm64-v8a", "mips")}`)).status, 404);
+});
+
+test("the v1 answer names the repository the game waits in, a fork's too", async () => {
+  const fork = { ...env, REPO: "sayo/mod-builds" };
+  github.repo = "sayo/mod-builds";
+  const told = await (await call("POST", "/v1/build?version=0.8.0", { body: mods, as: fork })).json();
+  assert.deepEqual(told, { job: await jobOf("0.8.0", COMMIT, mods), repo: "sayo/mod-builds" });
 });

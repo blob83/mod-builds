@@ -1,0 +1,114 @@
+name: catalog
+run-name: catalog ${{ inputs.build }} ${{ inputs.abi }}
+# Compile v2's store, ahead of the players: every native mod in Horizon's catalog
+# (horizon-rust.github.io/horizon-mods, kind native-mod), each version for the build's game, built once
+# for one game build (a Nightly) and ABI beside that build's base (store-base.yml, which runs first and
+# puts the build in builds.json), so a game finds it in mods-<build>/index.json and never asks the Compile
+# service for it (scripts/store.py).
+#
+# The mods are built as mod.yml builds one: in the sandbox, with a token that can only read; a job that
+# runs nothing of them publishes. A mod already in the index, or failed there for good, is not built
+# again; run it again after the catalog grows.
+on:
+  workflow_dispatch:
+    inputs:
+      build:
+        description: The game build (its full commit), in the store's builds.json
+        required: true
+      abi:
+        description: The ABI to build for
+        default: arm64-v8a
+permissions:
+  contents: read
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    outputs:
+      count: ${{ steps.plan.outputs.count }}
+    env:
+      BUILD: ${{ inputs.build }}
+      ABIS: ${{ inputs.abi }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - id: plan
+        name: What the build lacks
+        run: python3 scripts/store.py plan plan.json
+      - uses: actions/upload-artifact@v4
+        with:
+          name: plan
+          path: plan.json
+          retention-days: 1
+  build:
+    needs: plan
+    if: needs.plan.outputs.count != '0'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 300
+    env:
+      BUILD: ${{ inputs.build }}
+      ABI: ${{ inputs.abi }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          name: plan
+      - name: The build's profile
+        run: python3 scripts/store.py env
+      - name: Make room
+        run: bash scripts/room.sh
+      - uses: actions/cache/restore@v4
+        with:
+          key: store-${{ inputs.build }}-${{ inputs.abi }}-${{ env.PROFILE }}
+          fail-on-cache-miss: true
+          path: |
+            ~/.rustup
+            ~/android
+            ~/store/source
+            ~/store/cargo
+      - name: The mods, as the catalog has them
+        run: python3 scripts/store.py fetch plan.json mods
+      - name: Build
+        env:
+          SANDBOX_SECONDS: '17000'
+        run: bash scripts/sandbox.sh plan.json mods result
+      # What was built before a stop goes up too: the next run plans only the rest.
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: result
+          path: result/
+          retention-days: 1
+          compression-level: 1
+  publish:
+    needs: build
+    if: always() && needs.build.result != 'skipped'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    concurrency:
+      group: index-${{ inputs.build }}
+      cancel-in-progress: false
+    permissions:
+      contents: write
+    env:
+      BUILD: ${{ inputs.build }}
+      GH_TOKEN: ${{ github.token }}
+      GH_REPO: ${{ github.repository }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        continue-on-error: true
+        with:
+          name: result
+          path: result/
+      - name: The answers
+        run: python3 scripts/store.py publish result
+      - name: The index
+        run: python3 scripts/store.py index
