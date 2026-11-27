@@ -38,9 +38,11 @@ import zipfile
 sys.path.insert(0, str(pathlib.Path(__file__).resolve().parent))
 import store  # noqa: E402
 
-# What an unpacked .hmod may be at most, and how many files (a zip bomb stops here).
+# What an unpacked .hmod may be at most, and how many files (a zip bomb stops here). The file count is the
+# game's own limit for a package's content (sunrise-mod-package content.rs MAX_FILES): Macaw's mods and others
+# with a model per block passed 4000 (2026-11-27).
 UNPACKED = 64 << 20
-FILES = 4000
+FILES = 65_536
 # A mod's build, at most.
 SECONDS = int(os.environ.get("MOD_LIB_SECONDS", "600"))
 # `check`'s one cargo check of every job's package, the Horizon layer's rounds included.
@@ -323,7 +325,9 @@ def dependency_tables(cargo):
 def build_one(row, mods, source, result, build, profile):
     """One job's answer into `result`, built with the base's checkout `source`."""
     job, abi, digest = row["job"], row["abi"], row["sha256"]
-    status = {"build": build, "source": digest, "abi": abi}
+    # The catalog's id and version until the package's manifest says them: a package refused before its manifest is
+    # read is still an answer about that mod, which the index keeps (store.py about_of) and the plan asks no more.
+    status = {"build": build, "source": digest, "abi": abi, "id": row.get("id"), "version": row.get("version")}
     work = result / "work" / job
     shutil.rmtree(work, ignore_errors=True)
     folder, out = work / "mod", work / "out"

@@ -145,6 +145,12 @@ class Builds(unittest.TestCase):
             self.assertTrue(status["settled"])
         self.assertFalse((self.dir / "evil").exists())
 
+    def test_a_package_refused_before_its_manifest_is_still_an_answer_about_the_catalogs_mod(self):
+        row = {**self.job(b"not a zip at all"), "id": "wrench", "version": "1.0.0"}
+        status = mod_lib.build_one(row, self.mods, self.source, self.result, BUILD, "quick")
+        self.assertEqual((status["state"], status["id"], status["version"]), ("failed", "wrench", "1.0.0"))
+        self.assertEqual(store.about_of(status, row["job"])["id"], "wrench")
+
     def test_a_compile_error_is_the_mods_own_and_settled(self):
         body = hmod({"horizon-mod.toml": MANIFEST, "Cargo.toml": CARGO, "src/lib.rs": "", "src/broken.rs": ""})
         status, _ = self.build(body)
