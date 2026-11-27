@@ -1,4 +1,4 @@
-# measured on 1a19827ead8171a8f62ff9050580469136fa7928 (140 mods)
+# measured on 618e1e617d2a8e3b92f1aefb6f352ca5a8c16782 (141 mods)
 accel_torch
 actuallyadditions
 ambientsounds
@@ -114,6 +114,7 @@ securitycraft
 sfm
 silentgear
 simplebackups
+skinsrestorer
 solcarrot
 sootychimneys
 sophisticatedcore
